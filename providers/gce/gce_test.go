@@ -21,11 +21,15 @@ package gce
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 
 	cloudprovider "k8s.io/cloud-provider"
 )
@@ -359,9 +363,10 @@ func TestGenerateCloudConfigs(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name   string
-		config func() ConfigGlobal
-		cloud  func() CloudConfig
+		name    string
+		config  func() ConfigGlobal
+		cloud   func() CloudConfig
+		wantErr bool
 	}{
 		{
 			name:   "Empty Config",
@@ -479,11 +484,61 @@ func TestGenerateCloudConfigs(t *testing.T) {
 				return v
 			},
 		},
+		{
+			name: "Firewall Rules Management Enabled",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.FirewallRulesManagement = string(firewallRulesManagementEnabled)
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.FirewallRulesManagement = string(firewallRulesManagementEnabled)
+				return v
+			},
+		},
+		{
+			name: "Firewall Rules Management Disabled",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.FirewallRulesManagement = string(firewallRulesManagementDisabled)
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.FirewallRulesManagement = string(firewallRulesManagementDisabled)
+				return v
+			},
+		},
+		{
+			name: "Firewall Rules Management wrong case",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.FirewallRulesManagement = "disabled"
+				return v
+			},
+			wantErr: true,
+		},
+		{
+			name: "Firewall Rules Management unknown value",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.FirewallRulesManagement = "Off"
+				return v
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			resultCloud, err := GenerateCloudConfig(&ConfigFile{Global: tc.config()})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("GenerateCloudConfig() = %v, want error", resultCloud)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Unexpect error: %v", err)
 			}
@@ -491,6 +546,78 @@ func TestGenerateCloudConfigs(t *testing.T) {
 			v := tc.cloud()
 			if !reflect.DeepEqual(*resultCloud, v) {
 				t.Errorf("Got: \n%v\nWant\n%v\n", v, *resultCloud)
+			}
+		})
+	}
+}
+
+// optionTypeName returns the unexported type name of a ClientOption using reflection.
+func optionTypeName(opt option.ClientOption) string {
+	t := reflect.TypeOf(opt)
+	if t.Kind() == reflect.Ptr {
+		return "*" + t.Elem().Name()
+	}
+	return t.Name()
+}
+
+// writeFakeCredentials writes a minimal service account JSON to a temp file
+// and sets GOOGLE_APPLICATION_CREDENTIALS to point at it.
+func writeFakeCredentials(t *testing.T) {
+	t.Helper()
+	fakeJSON := `{
+		"type": "service_account",
+		"project_id": "test-project",
+		"private_key_id": "key-id",
+		"private_key": "fake-key",
+		"client_email": "test@test-project.iam.gserviceaccount.com",
+		"client_id": "123456789",
+		"token_uri": "https://oauth2.googleapis.com/token"
+	}`
+	f := filepath.Join(t.TempDir(), "creds.json")
+	if err := os.WriteFile(f, []byte(fakeJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", f)
+}
+
+func TestClientOptions(t *testing.T) {
+	tests := []struct {
+		name         string
+		ts           oauth2.TokenSource
+		wantOptTypes []string
+	}{
+		{
+			name: "custom token source uses WithTokenSource",
+			ts:   oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test"}),
+			wantOptTypes: []string{
+				"withTokenSource",
+			},
+		},
+		{
+			name: "JSON credentials uses WithAuthCredentialsJSON",
+			wantOptTypes: []string{
+				"withAuthCredentialsJSON",
+				"withUniverseDomain",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeFakeCredentials(t)
+
+			opts, err := clientOptions(tt.ts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(opts) != len(tt.wantOptTypes) {
+				t.Fatalf("got %d options, want %d", len(opts), len(tt.wantOptTypes))
+			}
+			for i, wantType := range tt.wantOptTypes {
+				if got := optionTypeName(opts[i]); got != wantType {
+					t.Errorf("opts[%d] type = %s, want %s", i, got, wantType)
+				}
 			}
 		})
 	}
@@ -637,4 +764,39 @@ func TestGetProjectsBasePath(t *testing.T) {
 			t.Errorf("Expected projects base path %s; but got %s", tc.expectProjectsBasePath, projectsBasePath)
 		}
 	}
+}
+
+func TestSharedResourceLocksScoping(t *testing.T) {
+	vals := DefaultTestClusterValues()
+	gce := NewFakeGCECloud(vals)
+	gce.SetEnableL4ILBFineGrainedLocks(true)
+
+	// Use the exact same resource name across different ResourceTypes
+	// to check that the namespace isolation prevents collisions.
+	const sharedName = "collide-test"
+
+	unlockHC := gce.lockHealthCheck(sharedName, true)
+	unlockIG := gce.lockInstanceGroup(sharedName, "zone-a")
+
+	var keys []string
+	gce.sharedResourceLocks.Range(func(key, value any) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+
+	// This check proves that namespace scoping prevented a key collision.
+	if len(keys) != 2 {
+		t.Fatalf("Expected exactly 2 locks (scoping failed to prevent collision), got %d", len(keys))
+	}
+
+	for _, k := range keys {
+		// Validating the internal prefix grammar.
+		if !strings.HasPrefix(k, string(ResourceTypeHealthCheck)+":") && !strings.HasPrefix(k, string(ResourceTypeInstanceGroup)+":") {
+			t.Errorf("Unexpected lock scoped in sharedResourceLocks: %s", k)
+		}
+	}
+
+	// Now release the locks
+	unlockHC()
+	unlockIG()
 }

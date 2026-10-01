@@ -21,6 +21,7 @@ package gce
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"runtime"
@@ -45,6 +46,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -118,6 +120,17 @@ const clusterStackIPV4 StackType = "IPV4"
 // The underlying VPC's stack type could be either IPV6 or dual stack IPV4_IPV6.
 const clusterStackIPV6 StackType = "IPV6"
 
+// FirewallRulesManagement indicates how firewall rules are managed by the provider.
+type FirewallRulesManagement string
+
+// firewallRulesManagementEnabled indicates that the firewall rules should be managed by the provider.
+// This includes firewall rule creation, deletion, and updates.
+const firewallRulesManagementEnabled FirewallRulesManagement = "Enabled"
+
+// firewallRulesManagementDisabled indicates that the firewall rules should not be managed by the provider.
+// This includes firewall rule creation, deletion, and updates.
+const firewallRulesManagementDisabled FirewallRulesManagement = "Disabled"
+
 // Cloud is an implementation of Interface, LoadBalancer and Instances for Google Compute Engine.
 type Cloud struct {
 	// ClusterID contains functionality for getting (and initializing) the ingress-uid. Call Cloud.Initialize()
@@ -180,11 +193,14 @@ type Cloud struct {
 	// resources are only created in zones with active node capacity.
 	nodeZones          map[string]sets.String
 	nodeInformerSynced cache.InformerSynced
+
 	// sharedResourceLock is used to serialize GCE operations that may mutate shared state to
 	// prevent inconsistencies. For example, load balancers manipulation methods will take the
 	// lock to prevent shared resources from being prematurely deleted while the operation is
 	// in progress.
 	sharedResourceLock sync.Mutex
+	// sharedResourceLocks is a concurrent map used for resource-specific fine-grained locking of shared resources (e.g. InstanceGroups, shared HealthChecks).
+	sharedResourceLocks sync.Map // map[string]*sync.Mutex
 	// AlphaFeatureGate gates gce alpha features in Cloud instance.
 	// Related wrapper functions that interacts with gce alpha api should examine whether
 	// the corresponding api is enabled.
@@ -224,6 +240,69 @@ type Cloud struct {
 
 	// enableL4DenyFirewallRollbackCleanup
 	enableL4DenyFirewallRollbackCleanup bool
+
+	// enableL4ILBFineGrainedLocks enables fine-grained resource-specific locking
+	enableL4ILBFineGrainedLocks bool
+
+	firewallRulesManagement FirewallRulesManagement
+}
+
+type SharedResourceType string
+
+const (
+	ResourceTypeHealthCheck   SharedResourceType = "hc"
+	ResourceTypeInstanceGroup SharedResourceType = "ig"
+	ResourceTypeFirewall      SharedResourceType = "fw"
+)
+
+func (g *Cloud) getLockForResource(resType SharedResourceType, name string) *sync.Mutex {
+	key := string(resType) + ":" + name
+	if v, ok := g.sharedResourceLocks.Load(key); ok {
+		return v.(*sync.Mutex)
+	}
+	v, _ := g.sharedResourceLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// lockSharedResourcesIfCoarse acquires the global sharedResourceLock when fine-grained
+// locking is disabled, preserving the legacy coarse locking behavior.
+// It returns a function to defer for unlocking.
+func (g *Cloud) lockSharedResourcesIfCoarse() func() {
+	if g.enableL4ILBFineGrainedLocks {
+		return func() { /* no-op */ }
+	}
+	g.sharedResourceLock.Lock()
+	return g.sharedResourceLock.Unlock
+}
+
+// lockResourceIfShared is a helper function for acquiring locks on shared resources.
+// If fine-grained locking is disabled or the resource is not shared, it does nothing.
+func (g *Cloud) lockResourceIfShared(shared bool, resType SharedResourceType, name string) func() {
+	if !g.enableL4ILBFineGrainedLocks || !shared {
+		return func() { /* no-op */ }
+	}
+	lock := g.getLockForResource(resType, name)
+	lock.Lock()
+	return lock.Unlock
+}
+
+// lockInstanceGroup locks the shared unmanaged instance group in the specified zone.
+// Since instance groups are always shared across the cluster, this locks unconditionally.
+// It returns a function to defer for unlocking.
+func (g *Cloud) lockInstanceGroup(igName, zone string) func() {
+	return g.lockResourceIfShared(true, ResourceTypeInstanceGroup, igName+"-"+zone)
+}
+
+// lockHealthCheck locks a health check resource by name.
+// It returns a function to defer for unlocking.
+func (g *Cloud) lockHealthCheck(hcName string, shared bool) func() {
+	return g.lockResourceIfShared(shared, ResourceTypeHealthCheck, hcName)
+}
+
+// lockFirewall locks a firewall resource by name.
+// It returns a function to defer for unlocking.
+func (g *Cloud) lockFirewall(fwName string, shared bool) func() {
+	return g.lockResourceIfShared(shared, ResourceTypeFirewall, fwName)
 }
 
 // ConfigGlobal is the in memory representation of the gce.conf config data
@@ -261,6 +340,10 @@ type ConfigGlobal struct {
 	// Default to none.
 	// For example: MyFeatureFlag
 	AlphaFeatures []string `gcfg:"alpha-features"`
+
+	// FirewallRulesManagement indicates whether the provider should handle all firewall
+	// operations, such as creation, deletion, and updates.
+	FirewallRulesManagement string `gcfg:"firewall-rules-management"`
 }
 
 // ConfigFile is the struct used to parse the /etc/gce.conf configuration file.
@@ -288,13 +371,14 @@ type CloudConfig struct {
 	SubnetworkName       string
 	SubnetworkURL        string
 	// DEPRECATED: Do not rely on this value as it may be incorrect.
-	SecondaryRangeName string
-	NodeTags           []string
-	NodeInstancePrefix string
-	TokenSource        oauth2.TokenSource
-	UseMetadataServer  bool
-	AlphaFeatureGate   *AlphaFeatureGate
-	StackType          string
+	SecondaryRangeName      string
+	NodeTags                []string
+	NodeInstancePrefix      string
+	TokenSource             oauth2.TokenSource
+	UseMetadataServer       bool
+	AlphaFeatureGate        *AlphaFeatureGate
+	StackType               string
+	FirewallRulesManagement string
 }
 
 func init() {
@@ -386,6 +470,13 @@ func GenerateCloudConfig(configFile *ConfigFile) (cloudConfig *CloudConfig, err 
 		cloudConfig.NodeTags = configFile.Global.NodeTags
 		cloudConfig.NodeInstancePrefix = configFile.Global.NodeInstancePrefix
 		cloudConfig.AlphaFeatureGate = NewAlphaFeatureGate(configFile.Global.AlphaFeatures)
+		switch m := FirewallRulesManagement(configFile.Global.FirewallRulesManagement); m {
+		case "", firewallRulesManagementEnabled, firewallRulesManagementDisabled:
+			cloudConfig.FirewallRulesManagement = string(m)
+		default:
+			return nil, fmt.Errorf("invalid firewall-rules-management %q: must be %q or %q",
+				m, firewallRulesManagementEnabled, firewallRulesManagementDisabled)
+		}
 	}
 
 	// retrieve projectID and zone
@@ -460,9 +551,46 @@ func GenerateCloudConfig(configFile *ConfigFile) (cloudConfig *CloudConfig, err 
 	return cloudConfig, err
 }
 
+// clientOptions returns GCP API client options for authentication.
+// A custom TokenSource set in the config, is used directly.
+// Otherwise, FindDefaultCredentials discovers credentials.
+// WithCredentialsJSON is preferred when available as it uses
+// self-signed JWTs, which may be necessary for custom universe domains.
+func clientOptions(ts oauth2.TokenSource) ([]option.ClientOption, error) {
+	if ts != nil {
+		return []option.ClientOption{option.WithTokenSource(ts)}, nil
+	}
+
+	creds, err := google.FindDefaultCredentials(context.Background(), compute.CloudPlatformScope)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find default credentials: %w", err)
+	}
+
+	var opts []option.ClientOption
+	if len(creds.JSON) > 0 {
+		var f struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(creds.JSON, &f); err != nil {
+			return nil, fmt.Errorf("failed to parse credentials JSON: %w", err)
+		}
+		opts = []option.ClientOption{option.WithAuthCredentialsJSON(option.CredentialsType(f.Type), creds.JSON)}
+	} else {
+		opts = []option.ClientOption{option.WithCredentials(creds)}
+	}
+
+	if ud, err := creds.GetUniverseDomain(); err == nil {
+		opts = append(opts, option.WithUniverseDomain(ud))
+	} else {
+		klog.Warningf("Failed to get universe domain from credentials: %v", err)
+	}
+
+	return opts, nil
+}
+
 // CreateGCECloud creates a Cloud object using the specified parameters.
 // If no networkUrl is specified, loads networkName via rest call.
-// If no tokenSource is specified, uses oauth2.DefaultTokenSource.
+// If no tokenSource is specified, uses FindDefaultCredentials.
 // If managedZones is nil / empty all zones in the region will be managed.
 func CreateGCECloud(config *CloudConfig) (*Cloud, error) {
 	// If ManagedZones was empty at startup, it means the cluster was configured
@@ -482,19 +610,24 @@ func CreateGCECloud(config *CloudConfig) (*Cloud, error) {
 		config.NetworkProjectID = config.ProjectID
 	}
 
-	service, err := compute.NewService(context.Background(), option.WithTokenSource(config.TokenSource))
+	clientOpts, err := clientOptions(config.TokenSource)
+	if err != nil {
+		return nil, err
+	}
+
+	service, err := compute.NewService(context.Background(), clientOpts...)
 	if err != nil {
 		return nil, err
 	}
 	service.UserAgent = userAgent
 
-	serviceBeta, err := computebeta.NewService(context.Background(), option.WithTokenSource(config.TokenSource))
+	serviceBeta, err := computebeta.NewService(context.Background(), clientOpts...)
 	if err != nil {
 		return nil, err
 	}
 	serviceBeta.UserAgent = userAgent
 
-	serviceAlpha, err := computealpha.NewService(context.Background(), option.WithTokenSource(config.TokenSource))
+	serviceAlpha, err := computealpha.NewService(context.Background(), clientOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +645,7 @@ func CreateGCECloud(config *CloudConfig) (*Cloud, error) {
 		}
 	}
 
-	containerService, err := container.NewService(context.Background(), option.WithTokenSource(config.TokenSource))
+	containerService, err := container.NewService(context.Background(), clientOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -583,6 +716,7 @@ func CreateGCECloud(config *CloudConfig) (*Cloud, error) {
 		metricsCollector:         newLoadBalancerMetrics(),
 		projectsBasePath:         getProjectsBasePath(service.BasePath),
 		stackType:                StackType(config.StackType),
+		firewallRulesManagement:  FirewallRulesManagement(config.FirewallRulesManagement),
 	}
 
 	gce.manager = &gceServiceManager{gce}
@@ -717,6 +851,9 @@ func (g *Cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 
 	go g.watchClusterID(stop)
 	go g.metricsCollector.Run(stop)
+	if g.dynamicZones {
+		go g.syncManagedZonesPeriodically(stop)
+	}
 }
 
 // LoadBalancer returns an implementation of LoadBalancer for Google Compute Engine.
@@ -923,6 +1060,10 @@ func (g *Cloud) SetEnableL4DenyFirewallRule(firewallEnabled, rollbackEnabled boo
 	g.enableL4DenyFirewallRollbackCleanup = rollbackEnabled
 }
 
+func (g *Cloud) SetEnableL4ILBFineGrainedLocks(enabled bool) {
+	g.enableL4ILBFineGrainedLocks = enabled
+}
+
 // getProjectsBasePath returns the compute API endpoint with the `projects/` element.
 // The suffix must be added when generating compute resource urls.
 func getProjectsBasePath(basePath string) string {
@@ -1059,4 +1200,12 @@ func (g *Cloud) refreshManagedZones() error {
 	}
 
 	return nil
+}
+
+func (g *Cloud) syncManagedZonesPeriodically(stop <-chan struct{}) {
+	wait.Until(func() {
+		if err := g.refreshManagedZones(); err != nil {
+			klog.Errorf("Periodic refresh of GCE managed zones failed: %v", err)
+		}
+	}, 5*time.Minute, stop)
 }

@@ -19,6 +19,7 @@ package cni
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,13 +29,20 @@ import (
 	"testing"
 	"time"
 
+	nncv1 "github.com/GoogleCloudPlatform/gke-networking-api/apis/nodenetworkconfig/v1"
+	nncfake "github.com/GoogleCloudPlatform/gke-networking-api/client/nodenetworkconfig/clientset/versioned/fake"
 	"github.com/containernetworking/cni/pkg/skel"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"google.golang.org/grpc"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k8s.io/apimachinery/pkg/util/wait"
+	kubefake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2"
 	pb "k8s.io/metis/api/adaptiveipam/v1"
 	"k8s.io/metis/pkg/daemon"
+	"k8s.io/metis/pkg/store"
 )
 
 type mockAdaptiveIpamClient struct {
@@ -44,21 +52,21 @@ type mockAdaptiveIpamClient struct {
 	checkPodIPFunc      func(ctx context.Context, in *pb.CheckPodIPRequest) (*pb.CheckPodIPResponse, error)
 }
 
-func (m *mockAdaptiveIpamClient) AllocatePodIP(ctx context.Context, in *pb.AllocatePodIPRequest, opts ...grpc.CallOption) (*pb.AllocatePodIPResponse, error) {
+func (m *mockAdaptiveIpamClient) AllocatePodIP(ctx context.Context, in *pb.AllocatePodIPRequest, _ ...grpc.CallOption) (*pb.AllocatePodIPResponse, error) {
 	if m.allocatePodIPFunc != nil {
 		return m.allocatePodIPFunc(ctx, in)
 	}
 	return nil, fmt.Errorf("unimplemented")
 }
 
-func (m *mockAdaptiveIpamClient) DeallocatePodIP(ctx context.Context, in *pb.DeallocatePodIPRequest, opts ...grpc.CallOption) (*pb.DeallocatePodIPResponse, error) {
+func (m *mockAdaptiveIpamClient) DeallocatePodIP(ctx context.Context, in *pb.DeallocatePodIPRequest, _ ...grpc.CallOption) (*pb.DeallocatePodIPResponse, error) {
 	if m.deallocatePodIPFunc != nil {
 		return m.deallocatePodIPFunc(ctx, in)
 	}
 	return nil, fmt.Errorf("unimplemented")
 }
 
-func (m *mockAdaptiveIpamClient) CheckPodIP(ctx context.Context, in *pb.CheckPodIPRequest, opts ...grpc.CallOption) (*pb.CheckPodIPResponse, error) {
+func (m *mockAdaptiveIpamClient) CheckPodIP(ctx context.Context, in *pb.CheckPodIPRequest, _ ...grpc.CallOption) (*pb.CheckPodIPResponse, error) {
 	if m.checkPodIPFunc != nil {
 		return m.checkPodIPFunc(ctx, in)
 	}
@@ -139,13 +147,13 @@ func TestCmdAdd(t *testing.T) {
 			logFile := filepath.Join(tempLogDir, "metis-cni.log")
 
 			plugin := NewPlugin(
-				WithClientFunc(func(socketPath string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
+				WithClientFunc(func(_ string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
 					return mockClient, nil, nil
 				}),
 				WithLogFile(logFile),
 			)
 
-			mockClient.allocatePodIPFunc = func(ctx context.Context, in *pb.AllocatePodIPRequest) (*pb.AllocatePodIPResponse, error) {
+			mockClient.allocatePodIPFunc = func(_ context.Context, in *pb.AllocatePodIPRequest) (*pb.AllocatePodIPResponse, error) {
 				if tc.assertInput != nil {
 					tc.assertInput(t, in)
 				}
@@ -236,14 +244,14 @@ func TestCmdDel(t *testing.T) {
 			logFile := filepath.Join(tempLogDir, "metis-cni.log")
 
 			plugin := NewPlugin(
-				WithClientFunc(func(socketPath string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
+				WithClientFunc(func(_ string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
 					return mockClient, nil, nil
 				}),
 				WithLogFile(logFile),
 			)
 
 			deallocateCalled := false
-			mockClient.deallocatePodIPFunc = func(ctx context.Context, in *pb.DeallocatePodIPRequest) (*pb.DeallocatePodIPResponse, error) {
+			mockClient.deallocatePodIPFunc = func(_ context.Context, _ *pb.DeallocatePodIPRequest) (*pb.DeallocatePodIPResponse, error) {
 				deallocateCalled = true
 				return &pb.DeallocatePodIPResponse{}, nil
 			}
@@ -275,14 +283,14 @@ func TestCmdCheck(t *testing.T) {
 	logFile := filepath.Join(tempLogDir, "metis-cni.log")
 
 	plugin := NewPlugin(
-		WithClientFunc(func(socketPath string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
+		WithClientFunc(func(_ string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
 			return mockClient, nil, nil
 		}),
 		WithLogFile(logFile),
 	)
 
 	checkCalled := false
-	mockClient.checkPodIPFunc = func(ctx context.Context, in *pb.CheckPodIPRequest) (*pb.CheckPodIPResponse, error) {
+	mockClient.checkPodIPFunc = func(_ context.Context, _ *pb.CheckPodIPRequest) (*pb.CheckPodIPResponse, error) {
 		checkCalled = true
 		return &pb.CheckPodIPResponse{}, nil
 	}
@@ -319,21 +327,34 @@ func TestCniWithActualDaemon(t *testing.T) {
 	logFile := filepath.Join(tempDir, "metis-cni.log")
 
 	plugin := NewPlugin(
-		WithClientFunc(func(path string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
+		WithClientFunc(func(_ string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
 			return getGrpcClient(socketPath)
 		}),
 		WithSocketPath(socketPath),
 		WithLogFile(logFile),
 	)
 
+	t.Setenv("NODE_NAME", "test-node")
+
 	cfg := daemon.Config{
 		DBPath:     dbPath,
 		SocketPath: socketPath,
 	}
-	d := daemon.NewDaemon(cfg)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	d := daemon.NewDaemon(cfg)
+	// Pre-populate with fake clients to satisfy the initialization requirements in Run() (they are not actually used by this test).
+	d.NNCClient = nncfake.NewSimpleClientset(&nncv1.NodeNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+	})
+	d.KubeClient = kubefake.NewSimpleClientset(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+	})
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -341,7 +362,7 @@ func TestCniWithActualDaemon(t *testing.T) {
 	}()
 
 	// Wait for socket to be created
-	err = wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(_ context.Context) (bool, error) {
 		if _, err := os.Stat(socketPath); err == nil {
 			return true, nil
 		}
@@ -410,8 +431,8 @@ func runWithOutputCapture(t *testing.T, f func() error) (stdout string, stderr s
 
 	err = f()
 
-	wOut.Close()
-	wErr.Close()
+	_ = wOut.Close()
+	_ = wErr.Close()
 
 	stdout = <-outC
 	stderr = <-errC
@@ -425,13 +446,13 @@ func TestCmdAdd_CleanStdout(t *testing.T) {
 	logFile := filepath.Join(tempLogDir, "metis-cni.log")
 
 	plugin := NewPlugin(
-		WithClientFunc(func(socketPath string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
+		WithClientFunc(func(_ string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
 			return mockClient, nil, nil
 		}),
 		WithLogFile(logFile),
 	)
 
-	mockClient.allocatePodIPFunc = func(ctx context.Context, in *pb.AllocatePodIPRequest) (*pb.AllocatePodIPResponse, error) {
+	mockClient.allocatePodIPFunc = func(_ context.Context, _ *pb.AllocatePodIPRequest) (*pb.AllocatePodIPResponse, error) {
 		return &pb.AllocatePodIPResponse{
 			Ipv4: &pb.PodIP{
 				IpAddress: "10.240.0.2",
@@ -463,5 +484,80 @@ func TestCmdAdd_CleanStdout(t *testing.T) {
 	var result current.Result
 	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 		t.Errorf("Stdout is not valid JSON, does not match schema, or has garbage: %v. Output was: %q", err, stdout)
+	}
+}
+
+func TestDirectFallback_DaemonUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "metis_fallback_test.sqlite")
+	logFile := filepath.Join(tempDir, "metis-cni-fallback.log")
+
+	plugin := NewPlugin(
+		WithClientFunc(func(_ string) (pb.AdaptiveIpamClient, *grpc.ClientConn, error) {
+			return nil, nil, fmt.Errorf("daemon socket unavailable (simulated test error)")
+		}),
+		WithDBPath(dbPath),
+		WithLogFile(logFile),
+	)
+
+	args := &skel.CmdArgs{
+		ContainerID: "test-container-id",
+		Netns:       "/var/run/netns/test",
+		IfName:      "eth0",
+		Args:        "K8S_POD_NAME=test-pod;K8S_POD_NAMESPACE=test-ns",
+		StdinData:   []byte(`{"cniVersion": "0.4.0", "name": "test-net", "type": "metis", "ipam": {"type": "metis", "ranges": [[{"subnet": "10.240.0.0/24"}]], "routes": [{"dst": "0.0.0.0/0"}]}}`),
+	}
+
+	// 1. CmdAdd via direct fallback
+	stdout, _, err := runWithOutputCapture(t, func() error {
+		return plugin.CmdAdd(args)
+	})
+	if err != nil {
+		t.Fatalf("CmdAdd via direct fallback failed: %v", err)
+	}
+
+	var result current.Result
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("Failed to unmarshal CNI result: %v", err)
+	}
+	if len(result.IPs) == 0 {
+		t.Fatalf("Expected allocated IP, got 0 IPs in result")
+	}
+
+	// 2. CmdCheck via direct fallback
+	_, _, err = runWithOutputCapture(t, func() error {
+		return plugin.CmdCheck(args)
+	})
+	if err != nil {
+		t.Fatalf("CmdCheck via direct fallback failed: %v", err)
+	}
+
+	// 3. CmdDel via direct fallback
+	_, _, err = runWithOutputCapture(t, func() error {
+		return plugin.CmdDel(args)
+	})
+	if err != nil {
+		t.Fatalf("CmdDel via direct fallback failed: %v", err)
+	}
+
+	// 4. Verify in SQLite that the deallocated IP was put into cooldown (release_at > now)
+	storeInstance, err := store.NewStore(context.Background(), klog.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open store for cooldown verification: %v", err)
+	}
+	defer storeInstance.Close()
+
+	allocatedIP := result.IPs[0].Address.IP.String()
+	var isAlloc bool
+	var releaseAt sql.NullInt64
+	err = storeInstance.DB().QueryRow("SELECT is_allocated, release_at FROM ip_addresses WHERE address = ?", allocatedIP).Scan(&isAlloc, &releaseAt)
+	if err != nil {
+		t.Fatalf("Failed to query IP address from store: %v", err)
+	}
+	if isAlloc {
+		t.Errorf("Expected is_allocated=false after CmdDel, got true")
+	}
+	if !releaseAt.Valid || releaseAt.Int64 <= time.Now().UnixMilli() {
+		t.Errorf("Expected valid future release_at timestamp for cooldown, got %v", releaseAt)
 	}
 }

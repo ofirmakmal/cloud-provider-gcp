@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - revive
+  settings:
+    revive:
+      rules:
+        # We currently ignore some of the stricter lint rules
+        - name: package-comments
+          disabled: true
+        - name: unused-parameter
+          disabled: true
+        - name: var-declaration
+          disabled: true
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-same-issues: 0
